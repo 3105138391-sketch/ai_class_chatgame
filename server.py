@@ -105,13 +105,14 @@ def build_gm_prompt(blueprint):
 3. 不要替玩家做重大选择。不要一回合解决整条主线。
 4. 回复末尾必须包含状态栏，格式：
 📍 地点 | 📌 阶段 | 🎭 身份/立场 | 🧭 目标 | ✨ 线索/资源
-5. 选项格式严格使用：
+5. A-D 选项只允许出现在回复最后四行，不要在叙事正文或状态栏中重复展示、解释或预告这些选项。
+6. 选项格式严格使用：
 A. 选项一
 B. 选项二
 C. 选项三
 D. 选项四
-6. 可以出现冲突、危机、斗法、追逐和辩论，但避免血腥细节和现实伤害指导。
-7. 如果玩家要求结束、退出或谢幕，引导其使用结束按钮或总结当前旅程。
+7. 可以出现冲突、危机、斗法、追逐和辩论，但避免血腥细节和现实伤害指导。
+8. 如果玩家要求结束、退出或谢幕，引导其使用结束按钮或总结当前旅程。
 """
 
 
@@ -322,7 +323,7 @@ title, sourceTitle, worldSummary, coreConflict, tone, visualStyle,
 factions[{name,goal}], locations[{name,keywords}], mainQuests[{title,keywords}],
 sideQuests[{title,keywords}], identitySuggestions[{name,description}],
 scenes[{label,keywords,prompt}], gmPrompt。
-gmPrompt 必须是完整系统提示词，要求主持人每轮 220-450 字，末尾包含状态栏和 A-D 四个选项。"""
+gmPrompt 必须是完整系统提示词，要求主持人每轮 220-450 字，末尾包含状态栏和 A-D 四个选项，并明确 A-D 选项只出现在回复最后四行，不在叙事正文中重复。"""
         user = f"来源标题：{source_title}\n\n故事/世界观材料：\n{source_text[:6000]}"
         try:
             content = self.deepseek_chat(
@@ -346,7 +347,7 @@ gmPrompt 必须是完整系统提示词，要求主持人每轮 220-450 字，�
             self._send_json(200, {"opening": opening, "fallback": True})
             return
         prompt = f"""请基于以下游戏蓝图和玩家身份，写第一幕开场。
-要求：220-450 字；第三人称；NPC 对白用「」；末尾必须有状态栏和 A-D 四个选项。
+要求：220-450 字；第三人称；NPC 对白用「」；末尾必须有状态栏和 A-D 四个选项。A-D 选项只放在回复最后四行，不要在正文中重复展示。
 状态栏格式：📍 地点 | 📌 阶段 | 🎭 身份/立场 | 🧭 目标 | ✨ 线索/资源
 
 游戏蓝图：

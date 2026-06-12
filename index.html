@@ -586,10 +586,26 @@ function setSystemMessage(text) {
 function getOptions(reply) {
   const opts = [];
   reply.split('\n').forEach(line => {
-    const match = line.match(/^[A-D][.、．]\s*(.+)/);
+    const match = line.match(/^\s*[A-D][.、．:：]\s*(.+)/);
     if (match) opts.push(match[1].trim());
   });
   return opts;
+}
+
+function stripInlineOptions(reply) {
+  const lines = String(reply || '').split('\n');
+  const cleaned = [];
+  let skippingOptions = false;
+  for (const line of lines) {
+    if (/^\s*[A-D][.、．:：]\s*.+/.test(line)) {
+      skippingOptions = true;
+      continue;
+    }
+    if (skippingOptions && /^\s*$/.test(line)) continue;
+    skippingOptions = false;
+    cleaned.push(line);
+  }
+  return cleaned.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function updateStatusFromReply(reply) {
@@ -632,6 +648,7 @@ function renderAssistantMessage(reply, imagePromise, speed = 28) {
   const gmDiv = document.createElement('div');
   gmDiv.className = 'msg gm';
   gmDiv._fullText = reply;
+  const displayText = stripInlineOptions(reply) || reply;
   out.appendChild(gmDiv);
   recordProgress(reply);
   const imageSlot = document.createElement('div');
@@ -644,7 +661,7 @@ function renderAssistantMessage(reply, imagePromise, speed = 28) {
     attachImage(imageSlot, imagePromise || postJSON(IMAGE_URL, { scene: extractScene(reply) }).then(data => data.url));
     out.scrollTop = out.scrollHeight;
   };
-  typeText(reply, gmDiv, speed, () => {
+  typeText(displayText, gmDiv, speed, () => {
     revealInlineImage();
     afterMessage(reply);
   });
