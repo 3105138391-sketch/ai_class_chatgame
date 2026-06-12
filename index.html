@@ -228,7 +228,7 @@ textarea::placeholder,input::placeholder { color:rgba(var(--pip-rgb),.30) }
       <h1>AI 文字游戏生成器</h1>
       <p>输入故事或世界观 · 自动生成可游玩的文字跑团</p>
       <div class="header-actions">
-        <button id="audio-toggle" type="button" aria-pressed="false" title="开启或关闭打字音效">打字音</button>
+        <button id="audio-toggle" type="button" aria-pressed="false" title="开启或关闭背景音乐与打字音效">音乐</button>
         <button id="end-run" type="button" class="hidden">结束</button>
       </div>
     </header>
@@ -291,6 +291,10 @@ const JOURNEY_SOURCE = `《西游记》古文版世界观摘要：
 
 let audioCtx = null;
 let typeGain = null;
+let bgmGain = null;
+let bgmTimer = null;
+let bgmStep = 0;
+let bgmDrones = [];
 let audioEnabled = false;
 let typeSoundCounter = 0;
 let currentBlueprint = null;
@@ -317,6 +321,9 @@ function initAudio() {
   typeGain = audioCtx.createGain();
   typeGain.gain.value = 0.08;
   typeGain.connect(audioCtx.destination);
+  bgmGain = audioCtx.createGain();
+  bgmGain.gain.value = 0.0001;
+  bgmGain.connect(audioCtx.destination);
 }
 
 async function resumeAudio() {
@@ -339,6 +346,79 @@ function playTone(freq, start, duration) {
   osc.stop(start + duration + 0.02);
 }
 
+function scheduleBgmNote(freq, start, duration, volume = 0.028) {
+  if (!audioCtx || !bgmGain) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(freq, start);
+  gain.gain.setValueAtTime(0.0001, start);
+  gain.gain.exponentialRampToValueAtTime(volume, start + 0.18);
+  gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+  osc.connect(gain);
+  gain.connect(bgmGain);
+  osc.start(start);
+  osc.stop(start + duration + 0.1);
+}
+
+function startBgm() {
+  if (!audioCtx || !bgmGain || bgmTimer) return;
+  const now = audioCtx.currentTime;
+  bgmGain.gain.cancelScheduledValues(now);
+  bgmGain.gain.setValueAtTime(Math.max(bgmGain.gain.value, 0.0001), now);
+  bgmGain.gain.linearRampToValueAtTime(0.42, now + 1.5);
+
+  const dronePlan = [
+    { freq: 110.00, type: 'sine', gain: 0.015 },
+    { freq: 164.81, type: 'triangle', gain: 0.008 }
+  ];
+  bgmDrones = dronePlan.map(plan => {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = plan.type;
+    osc.frequency.setValueAtTime(plan.freq, now);
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.linearRampToValueAtTime(plan.gain, now + 2);
+    osc.connect(gain);
+    gain.connect(bgmGain);
+    osc.start(now);
+    return { osc, gain };
+  });
+
+  const scale = [220.00, 246.94, 277.18, 329.63, 369.99, 440.00, 554.37, 659.25];
+  const pattern = [0, 2, 4, 5, 4, 2, 1, 2, 4, 6, 5, 4, 2, 0, 1, 2];
+  const playPhrase = () => {
+    if (!audioEnabled || !audioCtx) return;
+    const base = audioCtx.currentTime + 0.04;
+    for (let i = 0; i < 4; i += 1) {
+      const noteIndex = pattern[(bgmStep + i) % pattern.length];
+      scheduleBgmNote(scale[noteIndex], base + i * 0.72, 1.8, i === 0 ? 0.018 : 0.013);
+    }
+    bgmStep = (bgmStep + 4) % pattern.length;
+  };
+  playPhrase();
+  bgmTimer = setInterval(playPhrase, 2850);
+}
+
+function stopBgm() {
+  if (bgmTimer) clearInterval(bgmTimer);
+  bgmTimer = null;
+  if (!audioCtx || !bgmGain) return;
+  const now = audioCtx.currentTime;
+  bgmGain.gain.cancelScheduledValues(now);
+  bgmGain.gain.setValueAtTime(Math.max(bgmGain.gain.value, 0.0001), now);
+  bgmGain.gain.linearRampToValueAtTime(0.0001, now + 0.6);
+  bgmDrones.forEach(({ osc, gain }) => {
+    try {
+      gain.gain.cancelScheduledValues(now);
+      gain.gain.setValueAtTime(Math.max(gain.gain.value, 0.0001), now);
+      gain.gain.linearRampToValueAtTime(0.0001, now + 0.6);
+      osc.stop(now + 0.75);
+    } catch (_) {}
+  });
+  bgmDrones = [];
+}
+
 async function toggleAudio() {
   audioEnabled = !audioEnabled;
   const btn = document.getElementById('audio-toggle');
@@ -347,10 +427,12 @@ async function toggleAudio() {
     btn.textContent = '静音';
     btn.setAttribute('aria-pressed', 'true');
     await resumeAudio();
+    startBgm();
   } else {
     btn.classList.remove('active');
-    btn.textContent = '打字音';
+    btn.textContent = '音乐';
     btn.setAttribute('aria-pressed', 'false');
+    stopBgm();
   }
 }
 
@@ -647,8 +729,9 @@ function renderAssistantMessage(reply, imagePromise, speed = 28) {
   const out = document.getElementById('output');
   const gmDiv = document.createElement('div');
   gmDiv.className = 'msg gm';
-  gmDiv._fullText = reply;
   const displayText = stripInlineOptions(reply) || reply;
+  gmDiv._fullText = displayText;
+  gmDiv._rawText = reply;
   out.appendChild(gmDiv);
   recordProgress(reply);
   const imageSlot = document.createElement('div');
