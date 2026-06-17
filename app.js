@@ -434,20 +434,27 @@ async function sendMessage() {
 }
 
 function parseOptions(text) {
-  const lines = text.split('\n').filter(l => l.trim());
-  const optionPattern = /^[A-Da-d][.、．]\s*(.+)$/;
-  const opts = lines.filter(l => optionPattern.test(l.trim())).slice(-4);
+  const lines = text.split('\n');
+  const opts = [];
+  const optionPattern = /^[A-D][.、．]\s*(.+)/;
+  for (const line of lines) {
+    const m = line.match(optionPattern);
+    if (m) opts.push(m[1].trim());
+  }
   const area = document.getElementById('opts-area');
   area.innerHTML = '';
-  if (opts.length === 0) return;
-  opts.forEach(optText => {
-    const cleanText = optText.replace(/^[A-Da-d][.、．]\s*/, '').trim();
+  if (opts.length === 0) {
+    area.style.display = 'none';
+    return;
+  }
+  area.style.display = 'flex';
+  opts.slice(0, 4).forEach((opt, i) => {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'btn-opt';
-    btn.textContent = cleanText;
+    btn.textContent = String.fromCharCode(65 + i) + '. ' + opt;
     btn.addEventListener('click', () => {
-      document.getElementById('input').value = cleanText;
+      document.getElementById('input').value = opt;
       sendMessage();
     });
     area.appendChild(btn);
@@ -518,11 +525,9 @@ function appendGMMessage(text) {
       idx += 3;
       typingTimer = setTimeout(step, 18);
     } else {
-      // Final render — strip option lines from display text (clickable buttons shown below)
-      const optionPattern = /^[A-Da-d][.、．]\s*.+$/;
-      const lines = text.split('\n');
-      const displayLines = lines.filter(l => !optionPattern.test(l.trim()));
-      const displayText = displayLines.join('\n');
+      // Final render — strip option lines from display text
+      const displayLines = text.split('\n').filter(l => !/^[A-D][.、．]\s*/.test(l.trim()));
+      const displayText = displayLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
       div.textContent = '';
       div.innerHTML = escapeHTML(displayText).replace(/\n/g, '<br>');
       updateStatus(text);
