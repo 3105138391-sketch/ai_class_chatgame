@@ -1,1 +1,2 @@
-
+# 纯标准库项目，无需第三方依赖
+# server.py 使用 http.server + socketserver + urllib
