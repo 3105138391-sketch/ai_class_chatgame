@@ -530,7 +530,7 @@ function appendGMMessage(text) {
       const displayText = displayLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
       div.textContent = '';
       div.innerHTML = escapeHTML(displayText).replace(/\n/g, '<br>');
-      updateStatus(text);
+      updateStatus(displayText);
     }
   };
   step();
