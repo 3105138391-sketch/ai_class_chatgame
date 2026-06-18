@@ -110,7 +110,7 @@ function _tryAutoRecover() {
   document.getElementById('input-area').classList.remove('hidden');
   document.getElementById('opts-area').style.display = 'flex';
   document.getElementById('end-run').classList.remove('hidden');
-  document.getElementById('save-game').classList.remove('hidden');
+  setOptionalButtonVisible('save-game', true);
 
   const output = document.getElementById('output');
   output.innerHTML = '';
@@ -299,10 +299,13 @@ function updateStatus(text) {
 
 function setBusy(isBusy, text = '生成中') {
   const btn = document.getElementById('generate-game');
-  btn.disabled = isBusy;
-  document.getElementById('generate-hint').innerHTML = isBusy ?
-    `<span class="loading">▌</span> ${text}` :
-    '先生成世界蓝图，再选择身份开局。';
+  const hint = document.getElementById('generate-hint');
+  if (btn) btn.disabled = isBusy;
+  if (hint) {
+    hint.innerHTML = isBusy ?
+      `<span class="loading">▌</span> ${text}` :
+      '先生成世界蓝图，再选择身份开局。';
+  }
 }
 
 async function postJSON(url, payload) {
@@ -338,6 +341,43 @@ function showToast(msg) {
   toast.classList.add('show');
   clearTimeout(toast._hide);
   toast._hide = setTimeout(() => toast.classList.remove('show'), 2500);
+}
+
+function resetGameProgress() {
+  gameProgress.turns = 0;
+  gameProgress.main = new Set();
+  gameProgress.side = new Set();
+  gameProgress.locations = new Set();
+  gameProgress.scenes = new Set();
+  gameProgress.actions = [];
+}
+
+function setInteractionEnabled(isEnabled) {
+  const input = document.getElementById('input');
+  const sendBtn = document.getElementById('send');
+  if (input) input.disabled = !isEnabled;
+  if (sendBtn) sendBtn.disabled = !isEnabled;
+  if (isEnabled && !gameEnded && input && !document.getElementById('input-area')?.classList.contains('hidden')) {
+    input.focus();
+  }
+}
+
+function setOptionButtonsEnabled(isEnabled) {
+  document.querySelectorAll('#opts-area .btn-opt').forEach(btn => {
+    btn.disabled = !isEnabled;
+  });
+}
+
+function setOptionalButtonVisible(id, isVisible) {
+  const btn = document.getElementById(id);
+  if (!btn) return;
+  btn.classList.toggle('hidden', !isVisible);
+}
+
+function setButtonDisabled(id, isDisabled) {
+  const btn = document.getElementById(id);
+  if (!btn) return;
+  btn.disabled = isDisabled;
 }
 
 // ─── Presets & Setup ────────────────────────────────────────────────────────
@@ -388,7 +428,7 @@ function getPresetSource(id) {
 // ─── Generate Game ──────────────────────────────────────────────────────────
 
 async function generateGame() {
-  await resumeAudio();
+  resumeAudio().catch(console.warn);
 
   const presetId = getSelectedPresetId();
   const sourceText = document.getElementById('story-input').value.trim();
@@ -406,9 +446,9 @@ async function generateGame() {
     document.getElementById('setup-panel').classList.add('hidden');
     document.getElementById('identity-panel').classList.remove('hidden');
     document.getElementById('blueprint-summary').innerHTML = summarizeBlueprint(currentBlueprint);
-    renderIdentityOptions(currentBlueprint.identitySuggestions);
     document.getElementById('custom-identity').value = '';
     selectedIdentity = '';
+    renderIdentityOptions(currentBlueprint.identitySuggestions);
     document.getElementById('status').innerHTML = '<span>📚 蓝图中</span><span>📋 选择身份</span>';
     showToast('世界蓝图已生成');
   } catch (e) {
@@ -443,7 +483,7 @@ function renderIdentityOptions(identities) {
     list.appendChild(btn);
   });
   const first = list.querySelector('.identity-btn');
-  if (first) selectIdentity(presets[0]?.title ? '' : '', first);
+  if (first) selectIdentity(first.dataset.identity || '', first);
 }
 
 function selectIdentity(name, btn) {
@@ -456,9 +496,10 @@ function selectIdentity(name, btn) {
 
 async function startGame() {
   const identity = selectedIdentity || document.getElementById('custom-identity').value.trim() || '无名旅人';
-  document.getElementById('generate-game').disabled = true;
-  document.getElementById('start-game').disabled = true;
-  document.getElementById('start-game').textContent = '开局中…';
+  setButtonDisabled('generate-game', true);
+  setButtonDisabled('start-game', true);
+  const startBtn = document.getElementById('start-game');
+  if (startBtn) startBtn.textContent = '开局中…';
 
   try {
     const data = await postJSON(START_URL, {
@@ -470,12 +511,7 @@ async function startGame() {
     gameStarted = true;
     gameEnded = false;
     history = [];
-    gameProgress.turns = 0;
-    gameProgress.main = new Set();
-    gameProgress.side = new Set();
-    gameProgress.locations = new Set();
-    gameProgress.scenes = new Set();
-    gameProgress.actions = [];
+    resetGameProgress();
 
     // Clear any old session from localStorage
     _sessionClear();
@@ -484,22 +520,27 @@ async function startGame() {
     document.getElementById('identity-panel').classList.add('hidden');
     document.getElementById('setup-panel').classList.add('hidden');
     document.getElementById('input-area').classList.remove('hidden');
-    document.getElementById('opts-area').style.display = 'flex';
+    document.getElementById('opts-area').innerHTML = '';
+    document.getElementById('opts-area').style.display = 'none';
     document.getElementById('end-run').classList.remove('hidden');
-    document.getElementById('save-game').classList.remove('hidden');
+    setOptionalButtonVisible('save-game', true);
+    setInteractionEnabled(false);
 
     const output = document.getElementById('output');
     output.innerHTML = '';
 
-    appendGMMessage(opening);
+    await new Promise(resolve => appendGMMessage(opening, resolve));
+    parseOptions(opening);
+    setInteractionEnabled(true);
     maybeGenerateImage(opening);
     showToast('游戏开始');
   } catch (e) {
     showToast('开局失败: ' + e.message);
   } finally {
-    document.getElementById('generate-game').disabled = false;
-    document.getElementById('start-game').disabled = false;
-    document.getElementById('start-game').textContent = '以此身份开局';
+    setButtonDisabled('generate-game', false);
+    setButtonDisabled('start-game', false);
+    const startBtn = document.getElementById('start-game');
+    if (startBtn) startBtn.textContent = '以此身份开局';
   }
 }
 
@@ -517,7 +558,8 @@ async function sendMessage() {
   gameProgress.actions.push(msg);
 
   const sendBtn = document.getElementById('send');
-  sendBtn.disabled = true;
+  setInteractionEnabled(false);
+  setOptionButtonsEnabled(false);
   document.getElementById('opts-area').innerHTML = '';
 
   try {
@@ -530,8 +572,7 @@ async function sendMessage() {
     appendGMMessage('（主持人走神了——网络异常）');
     showToast('发送失败: ' + e.message);
   } finally {
-    sendBtn.disabled = false;
-    input.focus();
+    if (!gameEnded) setInteractionEnabled(true);
   }
 }
 
@@ -627,6 +668,7 @@ async function _sendStreaming() {
 
     // Auto-save session to localStorage
     _sessionSave();
+    setInteractionEnabled(true);
 
     return true;
   } catch (e) {
@@ -689,9 +731,9 @@ async function _sendNonStreaming() {
   }
 
   history.push({ role: 'assistant', content: content });
-  appendGMMessage(content);
-  maybeGenerateImage(content);
+  await new Promise(resolve => appendGMMessage(content, resolve));
   parseOptions(content);
+  maybeGenerateImage(content);
 
   // Auto-save session to localStorage
   _sessionSave();
@@ -771,7 +813,7 @@ function maybeGenerateImage(text) {
   .catch(() => {});
 }
 
-function appendGMMessage(text) {
+function appendGMMessage(text, onDone) {
   const output = document.getElementById('output');
   const div = document.createElement('div');
   div.className = 'msg gm';
@@ -798,6 +840,7 @@ function appendGMMessage(text) {
 
       // Auto-save session after rendering
       _sessionSave();
+      if (onDone) onDone();
     }
   };
   step();
@@ -896,7 +939,7 @@ async function loadGame(saveId) {
       document.getElementById('input-area').classList.remove('hidden');
       document.getElementById('opts-area').style.display = 'flex';
       document.getElementById('end-run').classList.remove('hidden');
-      document.getElementById('save-game').classList.remove('hidden');
+      setOptionalButtonVisible('save-game', true);
 
       const output = document.getElementById('output');
       output.innerHTML = '';
@@ -930,7 +973,7 @@ function endGame() {
   document.getElementById('input-area').classList.add('hidden');
   document.getElementById('opts-area').style.display = 'none';
   document.getElementById('end-run').classList.add('hidden');
-  document.getElementById('save-game').classList.add('hidden');
+  setOptionalButtonVisible('save-game', false);
 
   // Clear session on explicit end
   _sessionClear();
@@ -971,7 +1014,7 @@ function restartGame() {
   document.getElementById('opts-area').innerHTML = '';
   document.getElementById('opts-area').style.display = 'none';
   document.getElementById('input-area').classList.add('hidden');
-  document.getElementById('save-game').classList.add('hidden');
+  setOptionalButtonVisible('save-game', false);
 
   // Show setup again
   document.getElementById('setup-panel').classList.remove('hidden');

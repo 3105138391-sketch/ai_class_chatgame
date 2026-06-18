@@ -307,11 +307,19 @@ class MyHandler(Handler):
 
     def _read_json(self):
         raw_length = self.headers.get("Content-Length", "0")
-        length = min(int(raw_length), MAX_REQUEST_SIZE) if raw_length else 0
+        try:
+            length = int(raw_length) if raw_length else 0
+        except ValueError as exc:
+            raise ValueError("Content-Length 不合法") from exc
+        if length > MAX_REQUEST_SIZE:
+            raise ValueError("请求体过大")
         if length <= 0:
             return {}
         raw = self.rfile.read(length).decode("utf-8")
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("请求 JSON 格式错误") from exc
 
     def _open_json(self, req, timeout):
         try:
@@ -442,23 +450,28 @@ class MyHandler(Handler):
         return self._route_static_request(head_only=True)
 
     def do_POST(self):
-        # Rate-limit all API POST endpoints
-        if self.path.startswith("/api/"):
-            if not self._check_rate_limit():
-                return
-        if self.path == "/api/chat/stream":
-            return self.handle_chat_stream()
-        if self.path == "/api/chat":
-            return self.handle_chat()
-        if self.path == "/api/image":
-            return self.handle_image()
-        if self.path == "/api/generate-game":
-            return self.handle_generate_game()
-        if self.path == "/api/start-game":
-            return self.handle_start_game()
-        if self.path == "/api/save":
-            return self.handle_save()
-        self._send_json(404, {"message": "接口不存在"})
+        try:
+            # Rate-limit all API POST endpoints
+            if self.path.startswith("/api/"):
+                if not self._check_rate_limit():
+                    return
+            if self.path == "/api/chat/stream":
+                return self.handle_chat_stream()
+            if self.path == "/api/chat":
+                return self.handle_chat()
+            if self.path == "/api/image":
+                return self.handle_image()
+            if self.path == "/api/generate-game":
+                return self.handle_generate_game()
+            if self.path == "/api/start-game":
+                return self.handle_start_game()
+            if self.path == "/api/save":
+                return self.handle_save()
+            self._send_json(404, {"message": "接口不存在"})
+        except ValueError as exc:
+            self._send_json(400, {"message": str(exc)})
+        except Exception as exc:
+            self._send_json(500, {"message": f"服务器处理失败: {exc}"})
 
     def deepseek_chat(self, messages, temperature=0.8, max_tokens=1800):
         api_key = os.environ.get("DEEPSEEK_API_KEY")

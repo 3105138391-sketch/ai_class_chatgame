@@ -14,7 +14,14 @@ python server.py
 
 打开 `http://localhost:8080`。
 
-如果没有配置 API Key，本地仍可用内置西游记蓝图兜底验证流程，但不会真正调用模型扩写，也不会生成背景图。
+如果没有配置 API Key，本地仍可用内置西游记蓝图兜底验证流程，但不会真正调用模型扩写，也不会生成背景图。场景图按当前剧情懒加载，并由后端缓存，避免在生成蓝图时批量预生成。
+
+## 测试
+
+```bash
+python -m unittest discover -s tests
+python -m py_compile server.py
+```
 
 ## 环境变量
 
