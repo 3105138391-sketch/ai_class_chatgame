@@ -5,3 +5,4 @@ __pycache__/
 saves/
 *.log
 .DS_Store
+问卷编码结果.csv

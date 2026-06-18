@@ -7,6 +7,8 @@ import http.server
 import socketserver
 from urllib import error, request
 from urllib.parse import unquote, urlparse
+from collections import defaultdict
+from threading import Lock
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 PORT = int(os.environ.get("PORT", 8080))
@@ -31,6 +33,52 @@ BLOCKED_EXTENSIONS = {
 }
 
 Handler = http.server.SimpleHTTPRequestHandler
+
+# ─── Rate Limiter ─────────────────────────────────────────────────────────────
+# In-memory sliding window: {client_key: [timestamp, ...]}
+_RATELIMIT_LOCK = Lock()
+_RATELIMIT_BUCKETS = defaultdict(list)
+
+# Per-endpoint rate limits (requests per minute)
+RATELIMIT_CONFIG = {
+    # path_prefix: (max_requests, window_seconds)
+    "/api/chat":      (20, 60),      # Chat is expensive
+    "/api/image":     (10, 60),      # Image gen costs real money
+    "/api/generate-game": (6, 60),  # Calls DeepSeek
+    "/api/start-game":    (10, 60), # Calls DeepSeek
+    "/api/save":      (30, 60),
+    "default":        (60, 60),      # Load/presets/anything else
+}
+
+def _check_ratelimit(client_key, path):
+    """Returns True if allowed, False if rate limited."""
+    for prefix, (max_req, window) in RATELIMIT_CONFIG.items():
+        if path.startswith(prefix):
+            break
+    else:
+        max_req, window = RATELIMIT_CONFIG["default"]
+
+    now = time.time()
+    cutoff = now - window
+    with _RATELIMIT_LOCK:
+        timestamps = _RATELIMIT_BUCKETS[client_key]
+        # Prune old entries
+        _RATELIMIT_BUCKETS[client_key] = [t for t in timestamps if t > cutoff]
+        if len(_RATELIMIT_BUCKETS[client_key]) >= max_req:
+            return False
+        _RATELIMIT_BUCKETS[client_key].append(now)
+        return True
+
+
+def _get_client_key(handler):
+    """Get a rate-limit key for the current request.
+    Prefers X-Forwarded-For when behind a reverse proxy, falls back to client IP.
+    """
+    forwarded = handler.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    return handler.client_address[0]
+
 
 # ─── Image Cache ──────────────────────────────────────────────────────────────
 _image_cache = {}  # scene_prompt → {"url": str, "ts": float}
@@ -58,6 +106,12 @@ PRESETS = {
         "description": "参考公版《西游记》原文体系，生成三界、取经、劫难、妖国、天庭与西天秩序下的互动文字游戏。",
         "sourceUrl": "https://zh.wikisource.org/zh-hans/%E8%A5%BF%E6%B8%B8%E8%A8%98",
         "sourceText": "《西游记》古文版世界观摘要：\n- 世界结构：三界、四大部洲、天庭、西天、地府、龙宫、洞府妖国、人间国度。\n- 核心主题：取经、修心、劫难、神魔秩序、佛道体系、因果试炼。\n- 关键角色可作为 NPC 或势力出现：唐僧、孙悟空、猪八戒、沙僧、观音、玉帝、龙王、阎君、妖王。\n- 叙事应贴近章回体神魔小说气质，但文字游戏回复要现代可读、可操作。\n来源：https://zh.wikisource.org/zh-hans/西游記",
+    },
+    "fengshen": {
+        "title": "封神演义",
+        "description": "参考《封神演义》体系，在商周交替、仙妖乱世的神魔战争中，介入阐截之争、封神大劫。",
+        "sourceUrl": None,
+        "sourceText": "《封神演义》世界观摘要：\n- 时代背景：商朝末年，纣王无道，天下大乱。周武王起兵伐纣，引发三教（阐教、截教、人道）全面冲突。\n- 核心主题：天命劫数、仙妖斗法、封神榜、王朝更替、师徒因果。\n- 关键阵营：阐教（姜子牙、哪吒、杨戬等）、截教（通天教主、多宝道人、赵公明等）、商朝（纣王、妲己、闻仲）、周朝（武王、周公）。\n- 法宝与神通体系丰富：五行遁术、元神出窍、各式法宝（打神鞭、乾坤圈、阴阳镜等）。\n- 叙事风格：古典神魔小说气质，充满阵法斗法、天命因果、忠奸对抗。",
     },
     "sanguo": {
         "title": "三国风云",
@@ -196,6 +250,15 @@ def _load_game(save_id):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+# ─── SSE helpers for streaming ───────────────────────────────────────────────
+
+def _send_sse(wfile, event_type, data, ensure_ascii=False):
+    """Write a single SSE data frame."""
+    payload = json.dumps({"type": event_type, "content": data}, ensure_ascii=ensure_ascii)
+    wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+    wfile.flush()
+
+
 # ─── HTTP Handler ─────────────────────────────────────────────────────────────
 
 class MyHandler(Handler):
@@ -222,6 +285,16 @@ class MyHandler(Handler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_sse_headers(self):
+        """Send SSE response headers."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "keep-alive")
+        # No magic Content-Length — we're streaming
+        self.end_headers()
 
     def _send_not_found(self, head_only=False):
         body = b"Not Found"
@@ -298,6 +371,18 @@ class MyHandler(Handler):
         self.path = "/index.html"
         return Handler.do_HEAD(self) if head_only else Handler.do_GET(self)
 
+    def _check_rate_limit(self):
+        """Check rate limit for the current request. Returns True to proceed, False to 429."""
+        client_key = _get_client_key(self)
+        path = urlparse(self.path).path
+        allowed = _check_ratelimit(client_key, path)
+        if not allowed:
+            self._send_json(429, {
+                "message": "请求过于频繁，请稍后再试",
+                "retry_after_seconds": 30,
+            })
+        return allowed
+
     def do_GET(self):
         if self.path == "/healthz":
             self._send_json(200, {"ok": True})
@@ -357,6 +442,12 @@ class MyHandler(Handler):
         return self._route_static_request(head_only=True)
 
     def do_POST(self):
+        # Rate-limit all API POST endpoints
+        if self.path.startswith("/api/"):
+            if not self._check_rate_limit():
+                return
+        if self.path == "/api/chat/stream":
+            return self.handle_chat_stream()
         if self.path == "/api/chat":
             return self.handle_chat()
         if self.path == "/api/image":
@@ -402,6 +493,99 @@ class MyHandler(Handler):
                 raise
             return json.loads(match.group(0))
 
+    # ── Streaming Chat (SSE) ──────────────────────────────────────────────
+
+    def handle_chat_stream(self):
+        """Streaming chat via Server-Sent Events.
+        Calls DeepSeek with stream: true, forwards each content delta as SSE.
+        """
+        try:
+            payload = self._read_json()
+            api_key = os.environ.get("DEEPSEEK_API_KEY")
+
+            self._send_sse_headers()
+
+            if not api_key:
+                fallback = self.fallback_chat(payload)
+                _send_sse(self.wfile, "text", fallback)
+                self._send_sse_done()
+                return
+
+            messages = payload.get("messages", [])
+            deepseek_payload = {
+                "model": "deepseek-chat",
+                "messages": messages,
+                "temperature": 0.8,
+                "max_tokens": 1800,
+                "stream": True,
+            }
+
+            data = json.dumps(deepseek_payload, ensure_ascii=False).encode("utf-8")
+            req = request.Request(
+                DEEPSEEK_URL,
+                data=data,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                },
+                method="POST",
+            )
+
+            full_content = ""
+            with request.urlopen(req, timeout=90) as resp:
+                while True:
+                    line = resp.readline().decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    if line == "data: [DONE]":
+                        break
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        try:
+                            obj = json.loads(data_str)
+                            delta = obj.get("choices", [{}])[0].get("delta", {})
+                            # Skip empty role deltas
+                            if delta.get("role"):
+                                continue
+                            content = delta.get("content", "")
+                            if content:
+                                full_content += content
+                                _send_sse(self.wfile, "text", content, ensure_ascii=False)
+                        except json.JSONDecodeError:
+                            pass
+
+            # Parse options from the full assembled content
+            options = self._parse_options_from_text(full_content)
+            if options:
+                _send_sse(self.wfile, "options", options)
+
+            self._send_sse_done()
+
+        except Exception as exc:
+            try:
+                _send_sse(self.wfile, "error", str(exc))
+                self._send_sse_done()
+            except Exception:
+                pass
+
+    def _send_sse_done(self):
+        """Send the [DONE] signal to end the SSE stream."""
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    def _parse_options_from_text(self, text):
+        """Extract A-D options from a game master response text."""
+        options = []
+        for line in text.split("\n"):
+            if re.match(r"^[A-D][.、．]\s+", line):
+                opt_text = re.sub(r"^[A-D][.、．]\s*", "", line).strip()
+                if opt_text:
+                    options.append(opt_text)
+        return options
+
+    # ── Non-streaming Chat ────────────────────────────────────────────────
+
     def handle_chat(self):
         try:
             payload = self._read_json()
@@ -432,6 +616,8 @@ A. 追问行脚人的真实身份
 B. 顺着光痕寻找妖气来源
 C. 检查通关文牒的新字
 D. 暂时退入暗处，观察局势变化"""
+
+    # ── Game Generation (unchanged) ───────────────────────────────────────
 
     def handle_generate_game(self):
         payload = self._read_json()
@@ -501,6 +687,8 @@ A. 询问老僧第一场劫难的来历
 B. 检查残缺通关文牒上的暗纹
 C. 前往城门，观察来往人妖踪迹
 D. 隐藏身份，先在市井中打听消息"""
+
+    # ── Image Generation (unchanged) ─────────────────────────────────────
 
     def handle_image(self):
         api_key = os.environ.get("DASHSCOPE_API_KEY")

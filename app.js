@@ -1,6 +1,7 @@
 // ─── Game Core ──────────────────────────────────────────────────────────────
 
 const CHAT_URL = '/api/chat';
+const CHAT_STREAM_URL = '/api/chat/stream';
 const IMAGE_URL = '/api/image';
 const GENERATE_URL = '/api/generate-game';
 const START_URL = '/api/start-game';
@@ -25,6 +26,8 @@ let gameEnded = false;
 let generatedScenes = [];
 let currentSceneId = '';
 let gameStarted = false;
+let isStreamActive = false; // prevent concurrent streams
+let abortController = null; // for stream cancellation
 const gameProgress = {
   turns: 0,
   main: new Set(),
@@ -33,6 +36,121 @@ const gameProgress = {
   scenes: new Set(),
   actions: []
 };
+
+// ─── Session Auto-Recovery (localStorage) ────────────────────────────────────
+// Saves game state every time GM responds, and on page unload.
+// On page load, auto-recover if a saved session exists.
+
+const SESSION_KEY = 'ai_chatgame_session';
+
+function _sessionSave() {
+  if (!gameStarted || gameEnded) return;
+  try {
+    const data = {
+      blueprint: currentBlueprint,
+      identity: selectedIdentity,
+      history: history,
+      progress: {
+        turns: gameProgress.turns,
+        main: [...gameProgress.main],
+        side: [...gameProgress.side],
+        locations: [...gameProgress.locations],
+        actions: gameProgress.actions,
+        scenes: [...generatedScenes],
+      },
+      scene: currentSceneId,
+      timestamp: Date.now(),
+    };
+    localStorage.setItem(SESSION_KEY, JSON.stringify(data));
+  } catch (_) {
+    // Storage full or unavailable — silently skip
+  }
+}
+
+function _sessionClear() {
+  try {
+    localStorage.removeItem(SESSION_KEY);
+  } catch (_) {}
+}
+
+function _sessionLoad() {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    // Only recover sessions < 7 days old
+    if (Date.now() - (data.timestamp || 0) > 7 * 24 * 60 * 60 * 1000) {
+      _sessionClear();
+      return null;
+    }
+    return data;
+  } catch (_) {
+    return null;
+  }
+}
+
+function _tryAutoRecover() {
+  const data = _sessionLoad();
+  if (!data) return;
+
+  currentBlueprint = data.blueprint;
+  selectedIdentity = data.identity || '';
+  history = data.history || [];
+  generatedScenes = data.progress?.scenes || [];
+  gameProgress.turns = data.progress?.turns || 0;
+  gameProgress.main = new Set(data.progress?.main || []);
+  gameProgress.side = new Set(data.progress?.side || []);
+  gameProgress.locations = new Set(data.progress?.locations || []);
+  gameProgress.actions = data.progress?.actions || [];
+  gameStarted = true;
+  gameEnded = false;
+
+  document.getElementById('setup-panel').classList.add('hidden');
+  document.getElementById('identity-panel').classList.add('hidden');
+  document.getElementById('input-area').classList.remove('hidden');
+  document.getElementById('opts-area').style.display = 'flex';
+  document.getElementById('end-run').classList.remove('hidden');
+  document.getElementById('save-game').classList.remove('hidden');
+
+  const output = document.getElementById('output');
+  output.innerHTML = '';
+
+  // Replay history with a small delay to let the scroll area render
+  let delay = 0;
+  for (const msg of history) {
+    if (msg.role === 'assistant') {
+      setTimeout(() => _appendPlain(msg.content), delay);
+      delay += 30;
+    } else if (msg.role === 'user') {
+      setTimeout(() => _appendPlain(`> ${msg.content}`), delay);
+      delay += 10;
+    }
+  }
+
+  // Parse options from last assistant message
+  setTimeout(() => {
+    if (history.length > 0) {
+      const last = history[history.length - 1];
+      if (last.role === 'assistant') parseOptions(last.content);
+    }
+    showToast('已自动恢复上次游戏进度');
+  }, delay + 50);
+}
+
+function _appendPlain(text) {
+  const output = document.getElementById('output');
+  const div = document.createElement('div');
+  div.className = 'msg gm';
+  const displayLines = text.split('\n').filter(l => !/^[A-D][.、．]\s*/.test(l.trim()));
+  const displayText = displayLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  div.innerHTML = _escapeHTML(displayText).replace(/\n/g, '<br>');
+  output.appendChild(div);
+  output.scrollTop = output.scrollHeight;
+  updateStatus(displayText);
+}
+
+// Save session when user navigates away
+window.addEventListener('beforeunload', _sessionSave);
 
 // ─── Audio ──────────────────────────────────────────────────────────────────
 
@@ -198,7 +316,7 @@ async function postJSON(url, payload) {
   return data;
 }
 
-function escapeHTML(text) {
+function _escapeHTML(text) {
   return String(text ?? '').replace(/[&<>"']/g, ch => ({
     '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
   }[ch]));
@@ -239,9 +357,9 @@ async function loadPresets() {
       card.className = 'preset-card' + (idx === 0 ? ' selected' : '');
       card.dataset.id = p.id;
       card.innerHTML = `
-        <strong>${escapeHTML(p.title)}</strong>
-        <p>${escapeHTML(p.description)}</p>
-        ${p.sourceUrl ? `<a class="source-link" href="${escapeHTML(p.sourceUrl)}" target="_blank" rel="noopener noreferrer">来源：维基文库《西游记》</a>` : ''}
+        <strong>${_escapeHTML(p.title)}</strong>
+        <p>${_escapeHTML(p.description)}</p>
+        ${p.sourceUrl ? `<a class="source-link" href="${_escapeHTML(p.sourceUrl)}" target="_blank" rel="noopener noreferrer">来源：维基文库《西游记》</a>` : ''}
         <span class="check">✓</span>
       `;
       card.addEventListener('click', () => selectPreset(p.id));
@@ -264,7 +382,6 @@ function getSelectedPresetId() {
 }
 
 function getPresetSource(id) {
-  // The server has the full source text; we just pass the id
   return null;
 }
 
@@ -302,11 +419,11 @@ async function generateGame() {
 }
 
 function summarizeBlueprint(blueprint) {
-  const factions = asArray(blueprint.factions).slice(0, 4).map(item => escapeHTML(item.name || item)).join(' / ');
-  const locations = asArray(blueprint.locations).slice(0, 5).map(item => escapeHTML(item.name || item)).join(' / ');
+  const factions = asArray(blueprint.factions).slice(0, 4).map(item => _escapeHTML(item.name || item)).join(' / ');
+  const locations = asArray(blueprint.locations).slice(0, 5).map(item => _escapeHTML(item.name || item)).join(' / ');
   return `
-    <p><strong>${escapeHTML(blueprint.title || '未命名文字游戏')}</strong></p>
-    <p>${escapeHTML(blueprint.worldSummary || '')}</p>
+    <p><strong>${_escapeHTML(blueprint.title || '未命名文字游戏')}</strong></p>
+    <p>${_escapeHTML(blueprint.worldSummary || '')}</p>
     <p class="muted">势力：${factions || '待生成'}<br>地点：${locations || '待生成'}</p>
   `;
 }
@@ -320,12 +437,11 @@ function renderIdentityOptions(identities) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'identity-btn' + (index === 0 ? ' active' : '');
-    btn.innerHTML = `<strong>${escapeHTML(name)}</strong>${desc ? `<small>${escapeHTML(desc)}</small>` : ''}`;
+    btn.innerHTML = `<strong>${_escapeHTML(name)}</strong>${desc ? `<small>${_escapeHTML(desc)}</small>` : ''}`;
     btn.dataset.identity = name;
     btn.addEventListener('click', () => selectIdentity(name, btn));
     list.appendChild(btn);
   });
-  // Select first by default
   const first = list.querySelector('.identity-btn');
   if (first) selectIdentity(presets[0]?.title ? '' : '', first);
 }
@@ -361,6 +477,9 @@ async function startGame() {
     gameProgress.scenes = new Set();
     gameProgress.actions = [];
 
+    // Clear any old session from localStorage
+    _sessionClear();
+
     // Switch to game UI
     document.getElementById('identity-panel').classList.add('hidden');
     document.getElementById('setup-panel').classList.add('hidden');
@@ -384,7 +503,7 @@ async function startGame() {
   }
 }
 
-// ─── Chat & Gameplay ────────────────────────────────────────────────────────
+// ─── Streaming Chat ─────────────────────────────────────────────────────────
 
 async function sendMessage() {
   const input = document.getElementById('input');
@@ -397,40 +516,185 @@ async function sendMessage() {
   gameProgress.turns += 1;
   gameProgress.actions.push(msg);
 
-  document.getElementById('send').disabled = true;
+  const sendBtn = document.getElementById('send');
+  sendBtn.disabled = true;
   document.getElementById('opts-area').innerHTML = '';
 
   try {
-    const data = await postJSON(CHAT_URL, {
-      messages: history,
-      blueprint: currentBlueprint,
-      progress: {
-        turns: gameProgress.turns,
-        main: [...gameProgress.main],
-        side: [...gameProgress.side],
-        locations: [...gameProgress.locations],
-        actions: gameProgress.actions
-      }
-    });
-
-    let content;
-    if (data.choices && data.choices[0]) {
-      content = data.choices[0].message?.content || data.choices[0].text || '（主持人沉默不语）';
-    } else {
-      content = data.content || data.opening || '（主持人沉默了）';
+    // Try streaming first; fall back to regular POST on error
+    const usedStream = await _sendStreaming();
+    if (!usedStream) {
+      await _sendNonStreaming();
     }
-
-    history.push({ role: 'assistant', content: content });
-    appendGMMessage(content);
-    maybeGenerateImage(content);
-    parseOptions(content);
   } catch (e) {
     appendGMMessage('（主持人走神了——网络异常）');
     showToast('发送失败: ' + e.message);
   } finally {
-    document.getElementById('send').disabled = false;
+    sendBtn.disabled = false;
     input.focus();
   }
+}
+
+async function _sendStreaming() {
+  // Abort any in-flight stream
+  if (abortController) abortController.abort();
+  abortController = new AbortController();
+
+  const payload = {
+    messages: history,
+    blueprint: currentBlueprint,
+    progress: {
+      turns: gameProgress.turns,
+      main: [...gameProgress.main],
+      side: [...gameProgress.side],
+      locations: [...gameProgress.locations],
+      actions: gameProgress.actions
+    }
+  };
+
+  try {
+    const resp = await fetch(CHAT_STREAM_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: abortController.signal,
+    });
+
+    if (!resp.ok) {
+      // Server doesn't support streaming or rejected — fall back
+      return false;
+    }
+
+    // Create the streaming message element
+    const output = document.getElementById('output');
+    const div = document.createElement('div');
+    div.className = 'msg gm';
+    output.appendChild(div);
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n');
+      buffer = parts.pop() || ''; // Keep incomplete line in buffer
+
+      for (const line of parts) {
+        if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+          try {
+            const parsed = JSON.parse(line.slice(6));
+            const contentType = parsed.type;
+            const content = parsed.content;
+
+            if (contentType === 'text' && content) {
+              fullText += content;
+              _streamRender(div, fullText, content);
+            } else if (contentType === 'options' && Array.isArray(content)) {
+              // Options will be set after stream completes
+              fullText = _stripOptions(fullText);
+              _streamRenderOptions(div, fullText);
+            } else if (contentType === 'error') {
+              fullText = '（主持人走神了——' + content + '）';
+              _streamRender(div, fullText, fullText);
+              showToast('流式响应错误: ' + content);
+            }
+          } catch (_) {}
+        }
+      }
+    }
+
+    // Final render
+    isStreamActive = false;
+
+    // Build final content
+    const gmContent = fullText.trim();
+
+    history.push({ role: 'assistant', content: gmContent });
+
+    // Parse options from the content
+    parseOptions(gmContent);
+
+    // Update status from content
+    updateStatus(gmContent);
+
+    // Trigger image
+    maybeGenerateImage(gmContent);
+
+    // Auto-save session to localStorage
+    _sessionSave();
+
+    return true;
+  } catch (e) {
+    if (e.name === 'AbortError') return true;
+    return false; // Fall back to non-streaming
+  } finally {
+    isStreamActive = false;
+    abortController = null;
+  }
+}
+
+function _streamRender(div, fullText, latestChunk) {
+  // Render streaming text with progressive typewriter effect
+  const displayLines = fullText.split('\n').filter(l => !/^[A-D][.、．]\s*/.test(l.trim()));
+  const displayText = displayLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+
+  // Use textContent to avoid HTML escaping issues during streaming
+  div.textContent = displayText;
+  // Add <br> manually since textContent doesn't render newlines
+  div.innerHTML = _escapeHTML(displayText).replace(/\n/g, '<br>');
+
+  // Typing sound for the latest chunk
+  for (const ch of latestChunk) {
+    playTypingSound(ch);
+  }
+
+  // Scroll to bottom
+  const output = document.getElementById('output');
+  output.scrollTop = output.scrollHeight;
+}
+
+function _streamRenderOptions(div, strippedText) {
+  const displayLines = strippedText.split('\n').filter(l => !/^[A-D][.、．]\s*/.test(l.trim()));
+  const displayText = displayLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  div.innerHTML = _escapeHTML(displayText).replace(/\n/g, '<br>');
+}
+
+function _stripOptions(text) {
+  return text.split('\n').filter(l => !/^[A-D][.、．]\s*/.test(l.trim())).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+async function _sendNonStreaming() {
+  const data = await postJSON(CHAT_URL, {
+    messages: history,
+    blueprint: currentBlueprint,
+    progress: {
+      turns: gameProgress.turns,
+      main: [...gameProgress.main],
+      side: [...gameProgress.side],
+      locations: [...gameProgress.locations],
+      actions: gameProgress.actions
+    }
+  });
+
+  let content;
+  if (data.choices && data.choices[0]) {
+    content = data.choices[0].message?.content || data.choices[0].text || '（主持人沉默不语）';
+  } else {
+    content = data.content || data.opening || '（主持人沉默了）';
+  }
+
+  history.push({ role: 'assistant', content: content });
+  appendGMMessage(content);
+  maybeGenerateImage(content);
+  parseOptions(content);
+
+  // Auto-save session to localStorage
+  _sessionSave();
 }
 
 function parseOptions(text) {
@@ -519,7 +783,7 @@ function appendGMMessage(text) {
   const step = () => {
     if (idx < chars.length && gameStarted) {
       const chunk = chars.slice(idx, idx + 3).join('');
-      htmlBuffer += escapeHTML(chunk);
+      htmlBuffer += _escapeHTML(chunk);
       div.innerHTML = htmlBuffer.replace(/\n/g, '<br>');
       for (const ch of chunk) playTypingSound(ch);
       idx += 3;
@@ -529,8 +793,11 @@ function appendGMMessage(text) {
       const displayLines = text.split('\n').filter(l => !/^[A-D][.、．]\s*/.test(l.trim()));
       const displayText = displayLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
       div.textContent = '';
-      div.innerHTML = escapeHTML(displayText).replace(/\n/g, '<br>');
+      div.innerHTML = _escapeHTML(displayText).replace(/\n/g, '<br>');
       updateStatus(displayText);
+
+      // Auto-save session after rendering
+      _sessionSave();
     }
   };
   step();
@@ -543,7 +810,7 @@ function appendMessage(role, text) {
   const output = document.getElementById('output');
   const div = document.createElement('div');
   div.className = `msg ${role}`;
-  div.innerHTML = escapeHTML(text).replace(/\n/g, '<br>');
+  div.innerHTML = _escapeHTML(text).replace(/\n/g, '<br>');
   output.appendChild(div);
   output.scrollTop = output.scrollHeight;
 }
@@ -595,7 +862,7 @@ function showSavesPanel() {
         const card = document.createElement('div');
         card.className = 'save-card';
         const date = new Date(s.timestamp * 1000).toLocaleString('zh-CN');
-        card.innerHTML = `<strong>${escapeHTML(s.title)}</strong><small>${date}</small>`;
+        card.innerHTML = `<strong>${_escapeHTML(s.title)}</strong><small>${date}</small>`;
         card.addEventListener('click', () => loadGame(s.id));
         list.appendChild(card);
       });
@@ -665,6 +932,9 @@ function endGame() {
   document.getElementById('end-run').classList.add('hidden');
   document.getElementById('save-game').classList.add('hidden');
 
+  // Clear session on explicit end
+  _sessionClear();
+
   const output = document.getElementById('output');
   const summaryDiv = document.createElement('div');
   summaryDiv.className = 'msg system';
@@ -677,7 +947,7 @@ function endGame() {
 
   const roll = document.getElementById('credits-roll');
   roll.innerHTML = `
-    <h2>${escapeHTML(currentBlueprint?.title || 'AI 文字游戏')}</h2>
+    <h2>${_escapeHTML(currentBlueprint?.title || 'AI 文字游戏')}</h2>
     <p>—— 你的冒险已落幕 ——</p>
     <div class="big-stat">${gameProgress.turns} 回合</div>
     <h3>探索区域</h3>
@@ -685,7 +955,7 @@ function endGame() {
     <h3>主线推进</h3>
     <p>${[...gameProgress.main].join(' · ') || '开局入劫'}</p>
     <h3>你所扮演的</h3>
-    <p>${escapeHTML(selectedIdentity || '无名旅人')}</p>
+    <p>${_escapeHTML(selectedIdentity || '无名旅人')}</p>
   `;
 }
 
@@ -708,6 +978,8 @@ function restartGame() {
   document.getElementById('identity-panel').classList.add('hidden');
   document.getElementById('end-run').classList.add('hidden');
   document.getElementById('status').innerHTML = '<span>📚 等待故事</span><span>🧭 生成器待机</span><span>🎭 身份未定</span>';
+
+  _sessionClear();
 }
 
 // ─── DOM Content Loaded ─────────────────────────────────────────────────────
@@ -751,4 +1023,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       selectedIdentity = this.value.trim();
     }
   });
+
+  // Auto-recover session after everything is set up
+  setTimeout(_tryAutoRecover, 200);
 });
